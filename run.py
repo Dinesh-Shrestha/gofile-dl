@@ -4,6 +4,11 @@ import hashlib
 import logging
 import math
 import os
+import shlex
+import signal
+import subprocess
+import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 
@@ -32,6 +37,53 @@ class File:
         return f"{self.dest} ({self.link})"
 
 
+def aria2_download(
+    url, output, quiet, proxy, token, resume, aria2_args
+):
+    cmd = [
+        "aria2c",
+        url,
+        "-o",
+        os.path.basename(output),
+        "-d",
+        os.path.dirname(output) or ".",
+        f"--header=Cookie: accountToken={token}",
+        "--file-allocation=none",
+        "--auto-file-renaming=false",
+        "--allow-overwrite=true",
+    ]
+
+    if quiet:
+        cmd.append("--quiet=true")
+
+    if proxy:
+        cmd.append(f"--all-proxy={proxy}")
+
+    if resume:
+        cmd.append("--continue=true")
+
+    if aria2_args:
+        cmd.extend(shlex.split(aria2_args))
+    else:
+        # Balanced defaults
+        cmd.extend(["-x", "5", "-s", "5", "--min-split-size=1M"])
+
+    logger.info(f"Running aria2c command: {' '.join(cmd)}")
+
+    try:
+        proc = subprocess.Popen(cmd)
+        proc.wait()
+        return proc.returncode == 0
+    except KeyboardInterrupt:
+        if proc:
+            proc.terminate()
+            proc.kill()
+        raise
+    except Exception as e:
+        logger.error(f"aria2c error: {e}")
+        return False
+
+
 class Downloader:
     def __init__(self, token):
         self.token = token
@@ -40,9 +92,9 @@ class Downloader:
 
     # send HEAD request to get the file size, and check if the site supports range
     def _get_total_size(self, link):
-        r = requests.head(link, headers={"Cookie": f"accountToken={self.token}"})
+        r = requests.head(link, headers={"Cookie": f"accountToken={self.token}"}, allow_redirects=True)
         r.raise_for_status()
-        return int(r.headers["Content-Length"]), r.headers.get("Accept-Ranges", "none") == "bytes"
+        return int(r.headers.get("Content-Length", 0)), r.headers.get("Accept-Ranges", "none") == "bytes", r.url
 
     # download the range of the file
     def _download_range(self, link, start, end, temp_file, i):
@@ -74,19 +126,41 @@ class Downloader:
                 os.remove(temp_file)
         shutil.rmtree(temp_dir)
 
-    def download(self, file: File, num_threads=4):
+    def download(self, file: File, num_threads=1, use_aria2=False, aria2_args=None, skip_if_exists=True, resume=True, quiet=False):
         link = file.link
         dest = file.dest
         temp_dir = dest + "_parts"
         try:
             # get file size, and if the site supports range
-            total_size, is_support_range = self._get_total_size(link)
+            total_size, is_support_range, final_url = self._get_total_size(link)
 
             # skip download if the file has been fully downloaded
             if os.path.exists(dest):
-                if os.path.getsize(dest) == total_size:
+                is_aria2_incomplete = use_aria2 and os.path.exists(dest + ".aria2")
+                if (resume or skip_if_exists) and not is_aria2_incomplete:
+                    # For requests, we check size match if possible
+                    if not use_aria2 and total_size > 0 and os.path.getsize(dest) != total_size:
+                        pass # proceed
+                    else:
+                        logger.info(f"Skipping already downloaded file: {dest}")
+                        return
+
+            if use_aria2:
+                is_aria2_incomplete = os.path.exists(dest + ".aria2")
+                success = aria2_download(
+                    url=final_url,
+                    output=dest,
+                    quiet=quiet,
+                    proxy=os.environ.get("HTTP_PROXY"),
+                    token=self.token,
+                    resume=resume or is_aria2_incomplete,
+                    aria2_args=aria2_args,
+                )
+                if success:
                     return
-            
+                else:
+                    logger.warning("aria2c failed, falling back to internal downloader")
+
             if num_threads == 1 or not is_support_range:
                 temp_file = dest + ".part"
 
@@ -224,7 +298,11 @@ class GoFile(metaclass=GoFileMeta):
         proxy: str = None, 
         num_threads: int = 1, 
         includes: list[str] = None, 
-        excludes: list[str] = None) -> None:
+        excludes: list[str] = None,
+        use_aria2: bool = False,
+        aria2_args: str = None,
+        skip_if_exists: bool = True,
+        resume: bool = True) -> None:
         if proxy is not None:
             logger.info(f"Proxy set to: {proxy}")
             os.environ['HTTP_PROXY'] = proxy
@@ -235,7 +313,14 @@ class GoFile(metaclass=GoFileMeta):
 
         files = self.get_files(dir, content_id, url, password, includes, excludes)
         for file in files:
-            Downloader(token=self.token).download(file, num_threads=num_threads)
+            Downloader(token=self.token).download(
+                file, 
+                num_threads=num_threads,
+                use_aria2=use_aria2,
+                aria2_args=aria2_args,
+                skip_if_exists=skip_if_exists,
+                resume=resume
+            )
 
     def is_included(self, filename: str, includes: list[str]) -> bool:
         if len(includes) == 0:
@@ -302,7 +387,12 @@ class GoFile(metaclass=GoFileMeta):
             logger.error(f"invalid parameters")
         return files
 
-if __name__ == "__main__":
+def signal_handler(sig, frame):
+    logger.info("Interrupt received, exiting...")
+    os._exit(1)
+
+
+def run_main_logic():
     parser = argparse.ArgumentParser()
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("url", nargs='?', default=None, help="url to process (if not using -f)")
@@ -313,9 +403,43 @@ if __name__ == "__main__":
     parser.add_argument("-x", type=str, dest="proxy", help="proxy server (format: ip/host:port)")
     parser.add_argument("-i", action="append", dest="includes", help="included files (supporting wildcard *)")
     parser.add_argument("-e", action="append", dest="excludes", help="excluded files (supporting wildcard *)")
+    
+    parser.add_argument(
+        "--aria2c",
+        action="store_true",
+        help="use aria2c for download",
+    )
+    parser.add_argument(
+        "--aria2c-args",
+        help="additional arguments for aria2c",
+    )
+    parser.add_argument(
+        "--skip-if-exists",
+        action="store_true",
+        default=True,
+        help="skip download if file already exists (default: True)",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="overwrite existing file if it already exists",
+    )
+    parser.add_argument(
+        "--continue",
+        "-c",
+        dest="continue_",
+        action="store_true",
+        default=True,
+        help="resume getting partially-downloaded files (default: True)",
+    )
+
     args = parser.parse_args()
     num_threads = args.num_threads if args.num_threads is not None else 1
     dir = args.dir if args.dir is not None else "./output"
+
+    skip_if_exists = args.skip_if_exists and not args.overwrite
+    resume = args.continue_ and not args.overwrite
+
     if args.file is not None:
         if os.path.exists(args.file):
             with open(args.file) as f:
@@ -330,7 +454,11 @@ if __name__ == "__main__":
                         proxy=args.proxy, 
                         num_threads=num_threads, 
                         includes=args.includes, 
-                        excludes=args.excludes)
+                        excludes=args.excludes,
+                        use_aria2=args.aria2c,
+                        aria2_args=args.aria2c_args,
+                        skip_if_exists=skip_if_exists,
+                        resume=resume)
         else:
             logger.error(f"file not found: {args.file}")
     else:
@@ -341,4 +469,20 @@ if __name__ == "__main__":
             proxy=args.proxy, 
             num_threads=num_threads, 
             includes=args.includes, 
-            excludes=args.excludes)
+            excludes=args.excludes,
+            use_aria2=args.aria2c,
+            aria2_args=args.aria2c_args,
+            skip_if_exists=skip_if_exists,
+            resume=resume)
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    # Run in a daemon thread for responsive interruption
+    main_thread = threading.Thread(target=run_main_logic)
+    main_thread.daemon = True
+    main_thread.start()
+    
+    while main_thread.is_alive():
+        main_thread.join(timeout=0.1)

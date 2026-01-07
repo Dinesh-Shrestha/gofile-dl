@@ -20,20 +20,43 @@ python -m pip install -r requirements.txt
 
 ## Usage (CLI) ##
 ```console
-usage: run.py [-h] [-f FILE] [-t NUM_THREADS] [-d DIR] [-p PASSWORD] [-x PROXY] [-i INCLUDES] [-e EXCLUDES] [url]
+usage: run.py [-h] [-f FILE] [-t NUM_THREADS] [-d DIR] [-p PASSWORD] [-x PROXY] [-i INCLUDES] [-e EXCLUDES] [--aria2c] [--aria2c-args ARIA2C_ARGS] [--skip-if-exists] [--overwrite] [-c] [url]
 
 positional arguments:
-  url             url to process (if not using -f)
+  url                   url to process (if not using -f)
 
 options:
-  -h, --help      show this help message and exit
-  -f FILE         local file to process
-  -t NUM_THREADS  number of threads (default: 1)
-  -d DIR          output directory
-  -p PASSWORD     password
-  -x PROXY        proxy server (format: ip/host:port)
-  -i INCLUDES     included files (supporting wildcard *)
-  -e EXCLUDES     excluded files (supporting wildcard *)
+  -h, --help            show this help message and exit
+  -f FILE               local file to process
+  -t NUM_THREADS        number of threads (default: 1)
+  -d DIR                output directory
+  -p PASSWORD           password
+  -x PROXY              proxy server (format: ip/host:port)
+  -i INCLUDES           included files (supporting wildcard *)
+  -e EXCLUDES           excluded files (supporting wildcard *)
+  --aria2c              use aria2c for download
+  --aria2c-args ARIA2C_ARGS
+                        additional arguments for aria2c
+  --skip-if-exists      skip download if file already exists (default: True)
+  --overwrite           overwrite existing file if it already exists
+  -c, --continue        resume getting partially-downloaded files (default: True)
+```
+
+### High-Speed Downloads (aria2c)
+
+*Gofile-dl* now integrates with `aria2c` for significantly faster multi-connection downloads. 
+Smart resumption and skipping are enabled by default—if a download is interrupted, it will pick up exactly where it left off on the next run.
+
+```console
+# Basic high-speed download
+python run.py --aria2c https://gofile.io/d/foobar
+
+# Custom connections (e.g., 16 connections)
+python run.py --aria2c --aria2c-args="-x 16 -s 16" https://gofile.io/d/foobar
+
+# Force re-download (ignore existing files)
+python run.py --aria2c --overwrite https://gofile.io/d/foobar
+```
 ```
 Default output directory is `./output` 
 
